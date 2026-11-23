@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
-use std::process::Command;
+use std::sync::Arc;
 
 use serde_json::{Number, Value as Json};
 
-use crate::runtime::{file_error, native};
+use crate::environment::Environment;
+use crate::runtime::native;
 use crate::{Error, Result, Value};
+use crate::{command, http};
 
 pub(crate) fn print_function() -> Value {
     native("print", None, |args| {
@@ -22,57 +22,54 @@ pub(crate) fn print_function() -> Value {
     })
 }
 
-pub(crate) fn modules() -> BTreeMap<String, Value> {
-    ["process", "json", "fs"]
-        .into_iter()
-        .map(|name| (name.into(), module(name).unwrap()))
-        .collect()
-}
+pub(crate) const MODULES: [&str; 10] = [
+    "process", "json", "fs", "env", "http", "time", "regex", "path", "math", "random",
+];
 
-pub(crate) fn module(name: &str) -> Option<Value> {
+pub(crate) fn module(name: &str, environment: &Arc<Environment>) -> Option<Value> {
     let functions = match name {
-        "process" => BTreeMap::from([("run".into(), native("process.run", Some(2), run))]),
+        "process" => {
+            let environment = environment.clone();
+            BTreeMap::from([(
+                "run".into(),
+                native("process.run", Some(2), move |args| run(args, &environment)),
+            )])
+        }
+        "http" => return Some(http::module()),
+        "env" => return Some(environment.module()),
+        "fs" => return Some(crate::filesystem::module()),
+        "time" => return Some(crate::time::module()),
         "json" => BTreeMap::from([
             (
                 "parse".into(),
-                native("json.parse", Some(1), |args| {
-                    let value = serde_json::from_str(args[0].as_str()?).map_err(json_error)?;
-                    from_json(value)
-                }),
+                native("json.parse", Some(1), |args| parse_json(args[0].as_str()?)),
             ),
             (
                 "stringify".into(),
-                native("json.stringify", Some(1), |args| {
-                    let value = to_json(&args[0], 0)?;
-                    Ok(serde_json::to_string(&value).map_err(json_error)?.into())
+                native("json.stringify", None, |args| {
+                    let (value, pretty) = match args {
+                        [value] => (value, false),
+                        [value, pretty] => (value, pretty.as_bool()?),
+                        _ => {
+                            return Err(Error::new(
+                                "TypeError",
+                                format!(
+                                    "json.stringify expects 1 or 2 arguments, got {}",
+                                    args.len()
+                                ),
+                            ));
+                        }
+                    };
+                    Ok(encode_json(value, pretty)?.into())
                 }),
             ),
         ]),
-        "fs" => BTreeMap::from([
-            (
-                "read_text".into(),
-                native("fs.read_text", Some(1), |args| {
-                    let path = Path::new(args[0].as_str()?);
-                    Ok(fs::read_to_string(path)
-                        .map_err(|error| file_error(path, error))?
-                        .into())
-                }),
-            ),
-            (
-                "write_text".into(),
-                native("fs.write_text", Some(2), |args| {
-                    let path = Path::new(args[0].as_str()?);
-                    fs::write(path, args[1].as_str()?).map_err(|error| file_error(path, error))?;
-                    Ok(Value::Null)
-                }),
-            ),
-        ]),
-        _ => return None,
+        _ => return crate::general::module(name),
     };
     Some(Value::map(functions))
 }
 
-fn run(args: &[Value]) -> Result<Value> {
+fn run(args: &[Value], environment: &Environment) -> Result<Value> {
     let executable = args[0].as_str()?;
     let Value::List(arguments) = &args[1] else {
         return Err(args[1].expected("a list of command arguments"));
@@ -82,23 +79,7 @@ fn run(args: &[Value]) -> Result<Value> {
         .iter()
         .map(Value::as_str)
         .collect::<Result<Vec<_>>>()?;
-    let output = Command::new(executable)
-        .args(&strings)
-        .output()
-        .map_err(|error| {
-            let mut error = Error::new(
-                "ProcessError",
-                format!("could not start {executable:?}: {error}"),
-            );
-            error.details = BTreeMap::from([
-                ("command".into(), executable.into()),
-                ("args".into(), Value::list(arguments.clone())),
-                ("exit_code".into(), Value::Null),
-                ("stdout".into(), "".into()),
-                ("stderr".into(), "".into()),
-            ]);
-            error
-        })?;
+    let output = command::execute(executable, &strings, environment)?;
     let mut fields = BTreeMap::from([
         (
             "exit_code".into(),
@@ -161,7 +142,7 @@ fn from_json(value: Json) -> Result<Value> {
     })
 }
 
-fn to_json(value: &Value, depth: usize) -> Result<Json> {
+pub(crate) fn to_json(value: &Value, depth: usize) -> Result<Json> {
     if depth >= 128 {
         return Err(Error::new("JsonError", "JSON nesting exceeds 128 levels"));
     }
@@ -188,8 +169,106 @@ fn to_json(value: &Value, depth: usize) -> Result<Json> {
                 .map(|(key, value)| Ok((key.clone(), to_json(value, depth + 1)?)))
                 .collect::<Result<_>>()?,
         ),
+        Value::Struct(value) => Json::Object(
+            value
+                .fields()
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), to_json(value, depth + 1)?)))
+                .collect::<Result<_>>()?,
+        ),
+        Value::Enum(value) => Json::String(value.member().into()),
         Value::Function(_) => {
             return Err(Error::new("JsonError", "functions cannot be serialized"));
         }
+        Value::Command(result) => {
+            let fields = ["out", "err", "code", "ok"]
+                .into_iter()
+                .map(|key| Ok((key.to_owned(), to_json(&result.field(key)?, depth + 1)?)))
+                .collect::<Result<_>>()?;
+            Json::Object(fields)
+        }
+    })
+}
+
+pub(crate) fn input_function() -> Value {
+    native("input", None, |args| {
+        let prompt = match args {
+            [] => "",
+            [prompt] => prompt.as_str()?,
+            _ => return Err(Error::new("TypeError", "input expects 0 or 1 arguments")),
+        };
+        let io_error = |error: io::Error| Error::new("IoError", error.to_string());
+        if !prompt.is_empty() {
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(prompt.as_bytes())
+                .and_then(|()| stdout.flush())
+                .map_err(io_error)?;
+        }
+        let mut text = String::new();
+        if io::stdin().read_line(&mut text).map_err(io_error)? == 0 {
+            return Ok(Value::Null);
+        }
+        if text.ends_with('\n') {
+            text.pop();
+            if text.ends_with('\r') {
+                text.pop();
+            }
+        }
+        Ok(text.into())
+    })
+}
+
+pub(crate) fn parse_json(text: &str) -> Result<Value> {
+    from_json(serde_json::from_str(text).map_err(json_error)?)
+}
+
+pub(crate) fn encode_json(value: &Value, pretty: bool) -> Result<String> {
+    let value = to_json(value, 0)?;
+    if pretty {
+        serde_json::to_string_pretty(&value)
+    } else {
+        serde_json::to_string(&value)
+    }
+    .map_err(json_error)
+}
+
+type StringMethod = fn(&str, &[Value]) -> Result<Value>;
+
+pub(crate) fn string_method(name: &str) -> Option<(usize, StringMethod)> {
+    Some(match name {
+        "trim" => (0, |text, _| Ok(text.trim().into())),
+        "lower" => (0, |text, _| Ok(text.to_lowercase().into())),
+        "upper" => (0, |text, _| Ok(text.to_uppercase().into())),
+        "split" => (1, |text, args| {
+            let separator = args[0].as_str()?;
+            if separator.is_empty() {
+                return Err(Error::new("ValueError", "split separator cannot be empty"));
+            }
+            Ok(Value::list(
+                text.split(separator).map(Value::from).collect(),
+            ))
+        }),
+        "replace" => (2, |text, args| {
+            Ok(text.replace(args[0].as_str()?, args[1].as_str()?).into())
+        }),
+        "starts_with" => (1, |text, args| {
+            Ok(Value::Bool(text.starts_with(args[0].as_str()?)))
+        }),
+        "ends_with" => (1, |text, args| {
+            Ok(Value::Bool(text.ends_with(args[0].as_str()?)))
+        }),
+        "join" => (1, |separator, args| {
+            let Value::List(values) = &args[0] else {
+                return Err(args[0].expected("a list of strings"));
+            };
+            let values = values.values();
+            let strings = values
+                .iter()
+                .map(Value::as_str)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(strings.join(separator).into())
+        }),
+        _ => return None,
     })
 }

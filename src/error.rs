@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::Value;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Position {
     pub line: usize,
     pub column: usize,
@@ -33,6 +33,23 @@ impl Error {
             location: None,
             details: BTreeMap::new(),
         }
+    }
+
+    pub fn exit_code(&self) -> Option<u8> {
+        if self.kind == "Exit"
+            && let Some(Value::Int(code)) = self.details.get("exit_code")
+        {
+            return u8::try_from(*code).ok();
+        }
+        None
+    }
+
+    pub(crate) fn exit(code: u8) -> Self {
+        let mut signal = Self::new("Exit", format!("script exited with status {code}"));
+        signal
+            .details
+            .insert("exit_code".into(), i64::from(code).into());
+        signal
     }
 
     pub(crate) fn at(mut self, path: &std::path::Path, position: Position) -> Self {

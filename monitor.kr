@@ -1,0 +1,89 @@
+# monitor_api.kr — Full-stack Kiro stress test: Structs, Enums, Match, Parallel, Regex & HTTP Server
+
+enum Health:
+    Online
+    Degraded
+    Offline
+
+struct Target:
+    name: String
+    url: String
+    status: Health = Health.Offline
+    latency_ms: Int = 0
+    note: String = ""
+
+    fn to_summary(self):
+        return "[{self.status.name}] {self.name} ({self.latency_ms}ms) - {self.note}"
+
+fn check_target(name, url):
+    start = time.now()
+    try:
+        res = retry(2, 100, () => http.get(url))
+        elapsed = time.now() - start
+        state = Health.Offline
+        if res.ok:
+            state = Health.Online
+        elif res.status >= 500:
+            state = Health.Degraded
+
+        return Target(
+            name: name,
+            url: url,
+            status: state,
+            latency_ms: elapsed,
+            note: "HTTP {res.status}",
+        )
+    catch err:
+        return Target(
+            name: name,
+            url: url,
+            status: Health.Offline,
+            latency_ms: time.now() - start,
+            note: err?.kind ?? "UnknownError",
+        )
+
+fn run_sweep():
+    endpoints = [
+        {name: "ollama", url: "http://127.0.0.1:11434/api/tags"},
+        {name: "openrouter", url: "https://openrouter.ai/api/v1/models"},
+    ]
+
+    # Run all probes concurrently using list comprehension + parallel
+    tasks = [() => check_target(ep.name, ep.url) for ep in endpoints]
+    results = parallel(tasks)
+
+    # Filter online targets and build a lookup map via comprehension
+    online = [t.name for t in results if t.status == Health.Online]
+    by_name = {t.name: t for t in results}
+
+    return {
+        checked_at: time.format(time.now()),
+        online_count: len(online),
+        online: online,
+        targets: by_name,
+    }
+
+fn router(req):
+    match req:
+        case {method: "GET", path: "/health"}:
+            return {status: 200, body: run_sweep()}
+        case {method: "GET", path} if regex.match("^/cx/", path):
+            filter_term = regex.replace("^/cx/", path, "")
+            tools = (
+                $ "cx --list"
+                -> lines()
+                -> filter(l => l contains filter_term)
+                -> map(l => l.split("\t")[0])
+            )
+            return {status: 200, body: {query: filter_term, count: len(tools), tools: tools}}
+        case _:
+            return {status: 404, body: {error: "No route for {req.method} {req.path}"}}
+
+# Quick CLI mode if passed `--once`, otherwise start live HTTP server on :8080
+if len(args) > 0 and args[0] == "--once":
+    data = run_sweep()
+    print(json.stringify(data, true))
+    exit(0)
+
+print("Kiro monitor live on http://127.0.0.1:8080 (try /health or /cx/wifi)")
+http.serve(8080, router)

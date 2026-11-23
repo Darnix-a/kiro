@@ -8,6 +8,7 @@ fail() {
 
 prefix="${HOME:?Set HOME before running the installer}/.local"
 configure_path=true
+install_embed=false
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -17,8 +18,9 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         --no-path) configure_path=false ;;
+        --embed) install_embed=true ;;
         -h|--help)
-            printf '%s\n' 'Usage: ./install.sh [--prefix DIRECTORY] [--no-path]'
+            printf '%s\n' 'Usage: ./install.sh [--prefix DIRECTORY] [--no-path] [--embed]'
             exit 0
             ;;
         *) fail "unknown option: $1" ;;
@@ -53,6 +55,25 @@ fi
 
 cargo install --locked --path "$source_dir" --bin kr --root "$prefix"
 "$bin_dir/kr" --version
+
+if [ "$install_embed" = true ]; then
+    case "$(uname -s)" in
+        Linux) library=libkiro.so ;;
+        Darwin) library=libkiro.dylib ;;
+        *) fail "the CoreX shared library is supported on Linux and macOS" ;;
+    esac
+    cargo build --locked --release --lib --manifest-path "$source_dir/Cargo.toml" \
+        --target-dir "$source_dir/target"
+    library_dir="$prefix/lib/kiro"
+    mkdir -p -- "$library_dir"
+    (
+        temporary_lib=$(mktemp "$library_dir/.libkiro.XXXXXX")
+        trap 'rm -f -- "$temporary_lib"' 0
+        install -m 755 "$source_dir/target/release/$library" "$temporary_lib"
+        mv -f -- "$temporary_lib" "$library_dir/$library"
+    )
+    printf 'Installed %s/%s\n' "$library_dir" "$library"
+fi
 
 add_to_config() {
     config=$1

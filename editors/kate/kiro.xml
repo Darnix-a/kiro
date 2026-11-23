@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE language SYSTEM "language.dtd">
+<language name="Kiro" section="Scripts" version="1" kateversion="5.0" extensions="*.kr">
+  <highlighting>
+    <list name="keywords">
+      <item>fn</item><item>struct</item><item>enum</item><item>match</item><item>case</item>
+      <item>if</item><item>elif</item><item>else</item><item>while</item><item>for</item><item>in</item>
+      <item>try</item><item>catch</item><item>return</item><item>break</item><item>continue</item>
+      <item>pass</item><item>import</item><item>export</item><item>as</item>
+      <item>and</item><item>or</item><item>not</item><item>contains</item>
+    </list>
+    <list name="constants"><item>true</item><item>false</item><item>null</item></list>
+    <list name="builtins">
+      <item>print</item><item>input</item><item>len</item><item>lines</item><item>range</item>
+      <item>filter</item><item>map</item><item>reduce</item><item>any</item><item>all</item>
+      <item>sort</item><item>unique</item><item>parallel</item><item>retry</item><item>exit</item>
+    </list>
+    <contexts>
+      <context name="Normal" attribute="Normal" lineEndContext="#stay">
+        <DetectChar char="#" attribute="Comment" context="Comment"/>
+        <RegExpr String="\$\s*&quot;" attribute="Command" context="DoubleCommand"/>
+        <RegExpr String="(?:\$\s*)?`" attribute="Command" context="Backtick"/>
+        <DetectChar char="&quot;" attribute="String" context="DoubleString"/>
+        <DetectChar char="'" attribute="String" context="SingleString"/>
+        <keyword String="keywords" attribute="Keyword" context="#stay"/>
+        <keyword String="constants" attribute="Constant" context="#stay"/>
+        <keyword String="builtins" attribute="Builtin" context="#stay"/>
+        <RegExpr String="\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b" attribute="Number" context="#stay"/>
+        <RegExpr String="-&gt;|=&gt;|\?\?|\?\.|\.\.\.|==|!=|&lt;=|&gt;=|[=+*/%&lt;&gt;|\-]" attribute="Operator" context="#stay"/>
+      </context>
+      <context name="Comment" attribute="Comment" lineEndContext="#pop"/>
+      <context name="DoubleString" attribute="String" lineEndContext="#pop">
+        <IncludeRules context="Escapes"/>
+        <DetectChar char="{" attribute="Interpolation" context="Interpolation"/>
+        <DetectChar char="&quot;" attribute="String" context="#pop"/>
+      </context>
+      <context name="SingleString" attribute="String" lineEndContext="#pop">
+        <IncludeRules context="Escapes"/>
+        <DetectChar char="'" attribute="String" context="#pop"/>
+      </context>
+      <context name="DoubleCommand" attribute="Command" lineEndContext="#pop">
+        <IncludeRules context="Escapes"/>
+        <DetectChar char="{" attribute="Interpolation" context="Interpolation"/>
+        <DetectChar char="&quot;" attribute="Command" context="#pop"/>
+      </context>
+      <context name="Backtick" attribute="Command" lineEndContext="#pop">
+        <IncludeRules context="Escapes"/>
+        <DetectChar char="{" attribute="Interpolation" context="Interpolation"/>
+        <DetectChar char="`" attribute="Command" context="#pop"/>
+      </context>
+      <context name="Escapes" attribute="Escape" lineEndContext="#stay">
+        <RegExpr String="\\." attribute="Escape" context="#stay"/>
+      </context>
+      <context name="Interpolation" attribute="Normal" lineEndContext="#pop">
+        <DetectChar char="}" attribute="Interpolation" context="#pop"/>
+        <DetectChar char="{" attribute="Interpolation" context="Interpolation"/>
+        <IncludeRules context="Normal"/>
+      </context>
+    </contexts>
+    <itemDatas>
+      <itemData name="Normal" defStyleNum="dsNormal"/>
+      <itemData name="Comment" defStyleNum="dsComment"/>
+      <itemData name="String" defStyleNum="dsString"/>
+      <itemData name="Command" defStyleNum="dsSpecialString"/>
+      <itemData name="Escape" defStyleNum="dsSpecialChar"/>
+      <itemData name="Keyword" defStyleNum="dsKeyword"/>
+      <itemData name="Constant" defStyleNum="dsConstant"/>
+      <itemData name="Builtin" defStyleNum="dsBuiltIn"/>
+      <itemData name="Number" defStyleNum="dsDecVal"/>
+      <itemData name="Operator" defStyleNum="dsOperator"/>
+      <itemData name="Interpolation" defStyleNum="dsSpecialChar"/>
+    </itemDatas>
+  </highlighting>
+  <general>
+    <comments><comment name="singleLine" start="#"/></comments>
+  </general>
+</language>

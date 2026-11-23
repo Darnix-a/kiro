@@ -1,0 +1,26 @@
+{
+  "name": "kiro-language",
+  "displayName": "Kiro",
+  "description": "Syntax highlighting for Kiro scripts",
+  "publisher": "darnix-a",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "kiro",
+        "aliases": ["Kiro"],
+        "extensions": [".kr"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "kiro",
+        "scopeName": "source.kiro",
+        "path": "./syntaxes/kiro.tmLanguage.json"
+      }
+    ]
+  }
+}

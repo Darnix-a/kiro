@@ -1,0 +1,58 @@
+{
+  "name": "Kiro",
+  "scopeName": "source.kiro",
+  "fileTypes": ["kr"],
+  "patterns": [{ "include": "#tokens" }],
+  "repository": {
+    "tokens": {
+      "patterns": [
+        { "name": "comment.line.number-sign.kiro", "match": "#.*$" },
+        { "include": "#commands" },
+        { "include": "#strings" },
+        {
+          "match": "\\b(fn)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.kiro" },
+            "2": { "name": "entity.name.function.kiro" }
+          }
+        },
+        {
+          "match": "\\b(struct|enum)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
+          "captures": {
+            "1": { "name": "storage.type.kiro" },
+            "2": { "name": "entity.name.type.kiro" }
+          }
+        },
+        { "name": "keyword.control.kiro", "match": "(?<!\\.)\\b(if|elif|else|while|for|in|try|catch|return|break|continue|pass|match|case|export|import|as)\\b" },
+        { "name": "keyword.operator.word.kiro", "match": "\\b(and|or|not|contains)\\b" },
+        { "name": "constant.language.kiro", "match": "\\b(true|false|null)\\b" },
+        { "name": "support.type.kiro", "match": "\\b(Any|Int|Float|Number|String|Bool|List|Map|Function)\\b" },
+        { "name": "support.function.kiro", "match": "(?<!\\.)\\b(print|input|len|lines|range|filter|map|reduce|any|all|sort|unique|parallel|retry|exit)\\b(?=\\s*\\()" },
+        { "name": "support.variable.kiro", "match": "\\b(args|fs|http|json|process|path|regex|env|time|math|random)\\b" },
+        { "name": "constant.numeric.kiro", "match": "\\b\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b" },
+        { "name": "keyword.operator.kiro", "match": "->|=>|\\?\\?|\\?\\.|\\.\\.\\.|==|!=|<=|>=|[=+*/%<>|\\-]" }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        { "name": "string.quoted.double.kiro", "begin": "\"", "end": "\"|$", "patterns": [{ "include": "#escape" }, { "include": "#interpolation" }] },
+        { "name": "string.quoted.single.kiro", "begin": "'", "end": "'|$", "patterns": [{ "include": "#escape" }] }
+      ]
+    },
+    "commands": {
+      "patterns": [
+        { "name": "string.interpolated.command.kiro", "begin": "\\$[ \\t]*\"", "end": "\"|$", "patterns": [{ "include": "#escape" }, { "include": "#interpolation" }] },
+        { "name": "string.interpolated.command.kiro", "begin": "(?:\\$[ \\t]*)?`", "end": "`|$", "patterns": [{ "include": "#escape" }, { "include": "#interpolation" }] }
+      ]
+    },
+    "escape": { "name": "constant.character.escape.kiro", "match": "\\\\." },
+    "interpolation": {
+      "name": "meta.interpolation.kiro",
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.kiro" } },
+      "end": "\\}|$",
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.kiro" } },
+      "patterns": [{ "include": "#interpolation" }, { "include": "#tokens" }]
+    }
+  }
+}

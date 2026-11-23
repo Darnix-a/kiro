@@ -1,20 +1,31 @@
-use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, Weak};
 
+use crate::command::{self, CmdResult};
+use crate::environment::Environment;
 use crate::error::{Error, Result};
+use crate::lexer::{Part, Template};
 use crate::parser::{
-    self, Binary, Block, Expression, ExpressionKind, Function, Import, Statement, StatementKind,
-    Unary,
+    self, Argument, Binary, Block, Expression, ExpressionKind, Function, Import, Statement,
+    StatementKind, Unary,
 };
 use crate::{Value, standard};
 
+mod builtins;
+mod language;
+use builtins::Builtin;
+pub use language::{EnumValue, StructValue};
+use language::{EvaluatedArgs, StructType};
+
 type Values = BTreeMap<String, Value>;
-type NativeFunction = dyn Fn(&[Value]) -> Result<Value>;
+type LocalFunction = dyn Fn(&[Value]) -> Result<Value>;
+type NativeFunction = dyn Fn(&[Value]) -> Result<Value> + Send + Sync;
+type LocalFunctions = BTreeMap<u64, Box<LocalFunction>>;
 
 pub struct Callable {
     name: String,
@@ -22,19 +33,33 @@ pub struct Callable {
 }
 
 enum CallableKind {
+    Builtin(Builtin),
+    Local {
+        arity: usize,
+        id: u64,
+    },
     Native {
         arity: Option<usize>,
         call: Box<NativeFunction>,
     },
     Script {
-        function: Rc<Function>,
+        function: Arc<Function>,
         scope: Weak<Scope>,
+        receiver: Option<Value>,
     },
+    Constructor(Arc<StructType>),
 }
 
 impl Callable {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn receiver(&self) -> Option<&Value> {
+        match &self.kind {
+            CallableKind::Script { receiver, .. } => receiver.as_ref(),
+            _ => None,
+        }
     }
 }
 
@@ -47,9 +72,9 @@ impl fmt::Debug for Callable {
 pub(crate) fn native(
     name: &str,
     arity: Option<usize>,
-    call: impl Fn(&[Value]) -> Result<Value> + 'static,
+    call: impl Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
 ) -> Value {
-    Value::Function(Rc::new(Callable {
+    Value::Function(Arc::new(Callable {
         name: name.into(),
         kind: CallableKind::Native {
             arity,
@@ -60,9 +85,17 @@ pub(crate) fn native(
 
 /// Configures which capabilities a new script execution can access.
 pub struct Interpreter {
+    config: SharedConfig,
+    locals: LocalFunctions,
+}
+
+#[derive(Default)]
+struct SharedConfig {
     globals: Values,
     modules: Values,
     file_imports: bool,
+    command_literals: bool,
+    environment: Arc<Environment>,
 }
 
 impl Default for Interpreter {
@@ -75,27 +108,40 @@ impl Interpreter {
     /// Creates an interpreter with pure helpers and no script-initiated I/O.
     pub fn new() -> Self {
         let mut interpreter = Self {
-            globals: Values::new(),
-            modules: Values::new(),
-            file_imports: false,
+            config: SharedConfig::default(),
+            locals: LocalFunctions::new(),
         };
-        interpreter.define_function("len", 1, |args| args[0].length());
+        interpreter.define_thread_safe_function("len", 1, |args| args[0].length());
+        interpreter.define_thread_safe_function("lines", 1, |args| args[0].lines());
+        interpreter.set_global("range", native("range", None, crate::general::range));
+        for (name, kind) in Builtin::PRELUDE {
+            interpreter.set_global(
+                name,
+                Value::Function(Arc::new(Callable {
+                    name: name.into(),
+                    kind: CallableKind::Builtin(kind),
+                })),
+            );
+        }
         interpreter
     }
 
     /// Creates an interpreter with the standard command-line capabilities.
     pub fn cli() -> Self {
         let mut interpreter = Self::new();
-        interpreter
-            .globals
-            .insert("print".into(), standard::print_function());
-        interpreter.modules = standard::modules();
+        interpreter.set_global("print", standard::print_function());
+        interpreter.set_global("input", standard::input_function());
+        for name in standard::MODULES {
+            interpreter
+                .enable_standard_module(name)
+                .expect("known standard module");
+        }
         interpreter.allow_file_imports();
         interpreter
     }
 
     pub fn set_global(&mut self, name: impl Into<String>, value: Value) {
-        self.globals.insert(name.into(), value);
+        self.config.globals.insert(name.into(), value);
     }
 
     pub fn define_function(
@@ -104,27 +150,50 @@ impl Interpreter {
         arity: usize,
         call: impl Fn(&[Value]) -> Result<Value> + 'static,
     ) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, AtomicOrdering::Relaxed);
+        self.locals.insert(id, Box::new(call));
         let name = name.into();
-        let function = native(&name, Some(arity), call);
-        self.set_global(name, function);
+        self.set_global(
+            name.clone(),
+            Value::Function(Arc::new(Callable {
+                name,
+                kind: CallableKind::Local { id, arity },
+            })),
+        );
+    }
+
+    /// Exposes a host function that may also run in a parallel task.
+    pub fn define_thread_safe_function(
+        &mut self,
+        name: impl Into<String>,
+        arity: usize,
+        call: impl Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
+    ) {
+        let name = name.into();
+        self.set_global(name.clone(), native(&name, Some(arity), call));
     }
 
     pub fn add_module(&mut self, name: impl Into<String>, exports: Values) {
-        self.modules.insert(name.into(), Value::map(exports));
+        self.config.modules.insert(name.into(), Value::map(exports));
     }
 
-    /// Makes a named standard module available to scripts in this interpreter.
+    /// Preloads a named standard module and also makes it available through import.
     pub fn enable_standard_module(&mut self, name: &str) -> Result<()> {
-        let module = standard::module(name).ok_or_else(|| {
+        let module = standard::module(name, &self.config.environment).ok_or_else(|| {
             Error::new("ImportError", format!("unknown standard module '{name}'"))
         })?;
-        self.modules.insert(name.into(), module);
+        self.config.modules.insert(name.into(), module.clone());
+        self.set_global(name, module);
+        if name == "process" {
+            self.config.command_literals = true;
+        }
         Ok(())
     }
 
     /// Allows scripts to load source files through relative or absolute imports.
     pub fn allow_file_imports(&mut self) {
-        self.file_imports = true;
+        self.config.file_imports = true;
     }
 
     pub fn run_file(&self, path: impl AsRef<Path>) -> Result<Value> {
@@ -137,44 +206,123 @@ impl Interpreter {
     pub fn run_source(&self, source: &str, path: impl AsRef<Path>) -> Result<Value> {
         let path = path.as_ref();
         let program = parser::parse(source, path)?;
-        let mut runtime = Runtime {
-            config: self,
+        let mut runtime = self.runtime(path);
+        let scope = Scope::file(path, &self.config.globals);
+        match runtime.block(&program, &scope)? {
+            Flow::Return(value) => Ok(value),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    pub fn repl(&self) -> Repl<'_> {
+        let path = Path::new("<repl>");
+        Repl {
+            runtime: self.runtime(path),
+            scope: Scope::file(path, &self.config.globals),
+        }
+    }
+
+    fn runtime(&self, path: &Path) -> Runtime<'_> {
+        Runtime {
+            config: &self.config,
+            locals: Some(&self.locals),
             modules: BTreeMap::new(),
             loading: BTreeSet::from([path.to_path_buf()]),
             captured_scopes: Vec::new(),
             call_depth: 0,
-        };
-        let scope = Scope::file(path, &self.globals);
-        match runtime.block(&program, &scope)? {
+        }
+    }
+}
+
+/// A sequence of submissions sharing one script scope and import cache.
+pub struct Repl<'a> {
+    runtime: Runtime<'a>,
+    scope: Arc<Scope>,
+}
+
+impl Repl<'_> {
+    pub fn needs_more_input(source: &str) -> bool {
+        let lines = source.lines().count();
+        let blank = source
+            .lines()
+            .last()
+            .is_some_and(|line| line.trim().is_empty());
+        match parser::parse(source, Path::new("<repl>")) {
+            Err(error) => {
+                error.message == "unclosed delimiter"
+                    || (!blank
+                        && matches!(
+                            error.message.as_str(),
+                            "expected an indented block" | "expected 'catch' after the try block"
+                        )
+                        && error.location.is_some_and(|at| at.line > lines))
+            }
+            Ok(program) => {
+                !blank
+                    && program.last().is_some_and(|statement| {
+                        matches!(
+                            statement.kind,
+                            StatementKind::Function(..)
+                                | StatementKind::Struct(..)
+                                | StatementKind::Enum(..)
+                                | StatementKind::Match(..)
+                                | StatementKind::If(..)
+                                | StatementKind::For(..)
+                                | StatementKind::While(..)
+                                | StatementKind::Try(..)
+                        )
+                    })
+            }
+        }
+    }
+
+    pub fn eval(&mut self, source: &str) -> Result<Value> {
+        let program = parser::parse(source, &self.scope.path)?;
+        if let Some((last, preceding)) = program.split_last()
+            && let StatementKind::Expression(expression) = &last.kind
+        {
+            if let Flow::Return(value) = self.runtime.block(preceding, &self.scope)? {
+                return Ok(value);
+            }
+            return self.runtime.expression(expression, &self.scope);
+        }
+        match self.runtime.block(&program, &self.scope)? {
             Flow::Return(value) => Ok(value),
             _ => Ok(Value::Null),
         }
     }
 }
 
+pub(crate) fn http_serve_function() -> Value {
+    Value::Function(Arc::new(Callable {
+        name: "http.serve".into(),
+        kind: CallableKind::Builtin(Builtin::Serve),
+    }))
+}
+
 struct Scope {
-    path: Rc<PathBuf>,
-    names: RefCell<Values>,
-    exports: RefCell<BTreeSet<String>>,
+    path: Arc<PathBuf>,
+    names: Mutex<Values>,
+    exports: Mutex<BTreeSet<String>>,
     local_names: BTreeSet<String>,
-    parent: Option<Rc<Scope>>,
-    captured: Cell<bool>,
+    parent: Option<Arc<Scope>>,
+    captured: AtomicBool,
 }
 
 impl Scope {
-    fn file(path: &Path, globals: &Values) -> Rc<Self> {
-        Rc::new(Self {
-            path: Rc::new(path.to_path_buf()),
-            names: RefCell::new(globals.clone()),
-            exports: RefCell::default(),
+    fn file(path: &Path, globals: &Values) -> Arc<Self> {
+        Arc::new(Self {
+            path: Arc::new(path.to_path_buf()),
+            names: Mutex::new(globals.clone()),
+            exports: Mutex::default(),
             local_names: BTreeSet::new(),
             parent: None,
-            captured: Cell::new(false),
+            captured: AtomicBool::new(false),
         })
     }
 
     fn get(&self, name: &str) -> Result<Value> {
-        if let Some(value) = self.names.borrow().get(name) {
+        if let Some(value) = self.names.lock().unwrap().get(name) {
             return Ok(value.clone());
         }
         if !self.local_names.contains(name)
@@ -186,17 +334,18 @@ impl Scope {
     }
 
     fn assign(&self, name: &str, value: Value, exported: bool) {
-        self.names.borrow_mut().insert(name.to_owned(), value);
+        self.names.lock().unwrap().insert(name.to_owned(), value);
         if exported {
-            self.exports.borrow_mut().insert(name.to_owned());
+            self.exports.lock().unwrap().insert(name.to_owned());
         }
     }
 
     fn module(&self) -> Value {
-        let names = self.names.borrow();
+        let names = self.names.lock().unwrap();
         Value::map(
             self.exports
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .map(|name| (name.clone(), names[name].clone()))
                 .collect(),
@@ -212,15 +361,16 @@ enum Flow {
 }
 
 struct Runtime<'a> {
-    config: &'a Interpreter,
+    config: &'a SharedConfig,
+    locals: Option<&'a LocalFunctions>,
     modules: BTreeMap<PathBuf, Value>,
     loading: BTreeSet<PathBuf>,
-    captured_scopes: Vec<Rc<Scope>>,
+    captured_scopes: Vec<Arc<Scope>>,
     call_depth: usize,
 }
 
 impl Runtime<'_> {
-    fn block(&mut self, statements: &Block, scope: &Rc<Scope>) -> Result<Flow> {
+    fn block(&mut self, statements: &[Statement], scope: &Arc<Scope>) -> Result<Flow> {
         for statement in statements {
             let flow = self
                 .statement(statement, scope)
@@ -232,28 +382,47 @@ impl Runtime<'_> {
         Ok(Flow::Next)
     }
 
-    fn statement(&mut self, statement: &Statement, scope: &Rc<Scope>) -> Result<Flow> {
+    fn statement(&mut self, statement: &Statement, scope: &Arc<Scope>) -> Result<Flow> {
         match &statement.kind {
             StatementKind::Assign(name, expression, exported) => {
                 let value = self.expression(expression, scope)?;
                 scope.assign(name, value, *exported);
             }
             StatementKind::Function(function, exported) => {
-                if !scope.captured.replace(true) {
-                    self.captured_scopes.push(scope.clone());
+                let callable = self.script_function(function, scope);
+                scope.assign(&function.name, callable, *exported);
+            }
+            StatementKind::Struct(declaration, exported) => {
+                let constructor = self.struct_constructor(declaration, scope);
+                scope.assign(&declaration.name, constructor, *exported);
+            }
+            StatementKind::Enum(name, members, exported) => {
+                let tag = Arc::new(name.clone());
+                let entries = members
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.clone(),
+                            Value::Enum(Arc::new(EnumValue::new(tag.clone(), member.clone()))),
+                        )
+                    })
+                    .collect();
+                scope.assign(name, Value::map(entries), *exported);
+            }
+            StatementKind::Destructure(pattern, expression) => {
+                let subject = self.expression(expression, scope)?;
+                let mut bindings = Values::new();
+                if !self.match_pattern(pattern, &subject, scope, &mut bindings)? {
+                    return Err(Error::new(
+                        "PatternError",
+                        "value does not match the assignment pattern",
+                    ));
                 }
-                let callable = Callable {
-                    name: function.name.clone(),
-                    kind: CallableKind::Script {
-                        function: function.clone(),
-                        scope: Rc::downgrade(scope),
-                    },
-                };
-                scope.assign(
-                    &function.name,
-                    Value::Function(Rc::new(callable)),
-                    *exported,
-                );
+                scope.names.lock().unwrap().extend(bindings);
+            }
+            StatementKind::Match(expression, cases) => {
+                let subject = self.expression(expression, scope)?;
+                return self.match_cases(&subject, cases, scope);
             }
             StatementKind::Import(import, name) => {
                 let module = self.import(import, &scope.path)?;
@@ -289,6 +458,7 @@ impl Runtime<'_> {
             StatementKind::Try(body, name, handler) => {
                 return match self.block(body, scope) {
                     Ok(flow) => Ok(flow),
+                    Err(error) if error.exit_code().is_some() => Err(error),
                     Err(error) => {
                         scope.assign(name, error.into_value(), false);
                         self.block(handler, scope)
@@ -305,6 +475,11 @@ impl Runtime<'_> {
             StatementKind::Break => return Ok(Flow::Break),
             StatementKind::Continue => return Ok(Flow::Continue),
             StatementKind::Pass => {}
+            StatementKind::Command(template) => {
+                let command = self.command_args(template, scope)?;
+                let args: Vec<_> = command[1..].iter().map(String::as_str).collect();
+                command::stream(&command[0], &args, &self.config.environment)?;
+            }
             StatementKind::Expression(expression) => {
                 self.expression(expression, scope)?;
             }
@@ -312,20 +487,30 @@ impl Runtime<'_> {
         Ok(Flow::Next)
     }
 
-    fn condition(&mut self, condition: &Expression, scope: &Rc<Scope>) -> Result<bool> {
+    fn condition(&mut self, condition: &Expression, scope: &Arc<Scope>) -> Result<bool> {
         self.expression(condition, scope)?
             .as_bool()
             .map_err(|error| error.at(&scope.path, condition.at))
     }
 
-    fn expression(&mut self, expression: &Expression, scope: &Rc<Scope>) -> Result<Value> {
+    fn expression(&mut self, expression: &Expression, scope: &Arc<Scope>) -> Result<Value> {
         self.expression_inner(expression, scope)
             .map_err(|error| error.at(&scope.path, expression.at))
     }
 
-    fn expression_inner(&mut self, expression: &Expression, scope: &Rc<Scope>) -> Result<Value> {
+    fn expression_inner(&mut self, expression: &Expression, scope: &Arc<Scope>) -> Result<Value> {
         match &expression.kind {
             ExpressionKind::Literal(value) => Ok(value.clone()),
+            ExpressionKind::Interpolated(parts) => {
+                Ok(self.interpolate(parts, scope, false)?.into())
+            }
+            ExpressionKind::Command(template) => {
+                let command = self.command_args(template, scope)?;
+                let args: Vec<_> = command[1..].iter().map(String::as_str).collect();
+                let output = command::execute(&command[0], &args, &self.config.environment)?;
+                Ok(Value::Command(Arc::new(CmdResult::from_output(output))))
+            }
+            ExpressionKind::Lambda(function) => Ok(self.script_function(function, scope)),
             ExpressionKind::Name(name) => scope.get(name),
             ExpressionKind::List(items) => {
                 let values = items
@@ -341,10 +526,32 @@ impl Runtime<'_> {
                     .collect::<Result<_>>()?;
                 Ok(Value::map(values))
             }
-            ExpressionKind::Field(object, name) => self.expression(object, scope)?.field(name),
+            ExpressionKind::Field(object, name, safe) => {
+                let receiver = self.expression(object, scope)?;
+                receiver.member(name, *safe)
+            }
             ExpressionKind::Index(object, index) => self
                 .expression(object, scope)?
                 .index(&self.expression(index, scope)?),
+            ExpressionKind::Slice(object, start, end) => {
+                let value = self.expression(object, scope)?;
+                let start = self.slice_bound(start.as_deref(), scope)?;
+                let end = self.slice_bound(end.as_deref(), scope)?;
+                value.slice(start, end)
+            }
+            ExpressionKind::ListComp(value, clause) => {
+                let output = self.comprehend(clause, scope, |runtime, scope| {
+                    runtime.expression(value, scope)
+                })?;
+                Ok(Value::list(output))
+            }
+            ExpressionKind::MapComp(key, value, clause) => {
+                let output = self.comprehend(clause, scope, |runtime, scope| {
+                    let key = runtime.expression(key, scope)?.as_str()?.to_owned();
+                    Ok((key, runtime.expression(value, scope)?))
+                })?;
+                Ok(Value::map(output.into_iter().collect()))
+            }
             ExpressionKind::Unary(operator, operand) => {
                 let value = self.expression(operand, scope)?;
                 match (operator, value) {
@@ -356,6 +563,13 @@ impl Runtime<'_> {
             }
             ExpressionKind::Binary(left, operator, right) => {
                 let left = self.expression(left, scope)?;
+                if matches!(operator, Binary::Coalesce) {
+                    return if matches!(left, Value::Null) {
+                        self.expression(right, scope)
+                    } else {
+                        Ok(left)
+                    };
+                }
                 if matches!(operator, Binary::And | Binary::Or) {
                     let left = left.as_bool()?;
                     if left == matches!(operator, Binary::Or) {
@@ -367,65 +581,178 @@ impl Runtime<'_> {
                 binary(left, *operator, right)
             }
             ExpressionKind::Call(callee, arguments) => {
-                let callee = if let ExpressionKind::Field(object, field) = &callee.kind {
-                    let receiver = self.expression(object, scope)?;
-                    if field == "append"
-                        && let Value::List(list) = receiver
-                    {
-                        check_arity("list.append", 1, arguments.len())?;
-                        list.append(self.expression(&arguments[0], scope)?)?;
-                        return Ok(Value::Null);
-                    }
-                    receiver.field(field)?
-                } else {
-                    self.expression(callee, scope)?
-                };
-                let mut values = Vec::with_capacity(arguments.len());
-                for argument in arguments {
-                    values.push(self.expression(argument, scope)?);
-                }
-                self.call(&callee, values)
+                self.call_expression(callee, arguments, scope, None)
+            }
+            ExpressionKind::Pipe(input, callee, arguments) => {
+                let input = self.expression(input, scope)?;
+                self.call_expression(callee, arguments, scope, Some(input))
             }
         }
     }
 
+    fn script_function(&mut self, function: &Arc<Function>, scope: &Arc<Scope>) -> Value {
+        self.retain_scope(scope);
+        Value::Function(Arc::new(Callable {
+            name: function.name.clone(),
+            kind: CallableKind::Script {
+                function: function.clone(),
+                scope: Arc::downgrade(scope),
+                receiver: None,
+            },
+        }))
+    }
+
+    fn retain_scope(&mut self, scope: &Arc<Scope>) {
+        if !scope.captured.swap(true, AtomicOrdering::Relaxed) {
+            self.captured_scopes.push(scope.clone());
+        }
+    }
+
+    fn command_args(
+        &mut self,
+        template: &Template<Expression>,
+        scope: &Arc<Scope>,
+    ) -> Result<Vec<String>> {
+        if !self.config.command_literals {
+            return Err(Error::new(
+                "ProcessError",
+                "command literals require the standard process module",
+            ));
+        }
+        template
+            .iter()
+            .map(|parts| self.interpolate(parts, scope, true))
+            .collect()
+    }
+
+    fn interpolate(
+        &mut self,
+        parts: &[Part<Expression>],
+        scope: &Arc<Scope>,
+        command: bool,
+    ) -> Result<String> {
+        let mut text = String::new();
+        for part in parts {
+            match part {
+                Part::Text(literal) => text.push_str(literal),
+                Part::Expression(expression) => {
+                    let value = self.expression(expression, scope)?;
+                    if command
+                        && !matches!(
+                            value,
+                            Value::String(_) | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                        )
+                    {
+                        return Err(value
+                            .expected("a string, boolean, or number for a command argument")
+                            .at(&scope.path, expression.at));
+                    }
+                    text.push_str(&value.to_string());
+                }
+            }
+        }
+        Ok(text)
+    }
+
+    fn call_expression(
+        &mut self,
+        callee: &Expression,
+        arguments: &[Argument],
+        scope: &Arc<Scope>,
+        piped: Option<Value>,
+    ) -> Result<Value> {
+        let arity = arguments.len() + usize::from(piped.is_some());
+        let optional = matches!(callee.kind, ExpressionKind::Field(_, _, true));
+        let callee = if let ExpressionKind::Field(object, field, safe) = &callee.kind {
+            let receiver = self.expression(object, scope)?;
+            if *safe && matches!(receiver, Value::Null) {
+                return Ok(Value::Null);
+            }
+            match (field.as_str(), &receiver) {
+                ("append", Value::List(list)) => {
+                    check_arity("list.append", 1, arity)?;
+                    let item = self
+                        .evaluate_args(arguments, scope, piped)?
+                        .positional_only("list.append")?
+                        .pop()
+                        .unwrap();
+                    list.append(item)?;
+                    return Ok(Value::Null);
+                }
+                ("lines", Value::String(_) | Value::Command(_)) => {
+                    check_arity(".lines", 0, arity)?;
+                    return receiver.lines();
+                }
+                (method, Value::String(text)) => {
+                    if let Some((count, call)) = standard::string_method(method) {
+                        check_arity(method, count, arity)?;
+                        let values = self
+                            .evaluate_args(arguments, scope, piped)?
+                            .positional_only(method)?;
+                        return call(text, &values);
+                    }
+                    receiver.member(field, *safe)?
+                }
+                ("json", Value::Map(fields))
+                    if !fields.contains_key("json") && fields.contains_key("body") =>
+                {
+                    check_arity(".json", 0, arity)?;
+                    return standard::parse_json(fields["body"].as_str()?);
+                }
+                _ => receiver.member(field, *safe)?,
+            }
+        } else {
+            self.expression(callee, scope)?
+        };
+        if optional && matches!(callee, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let values = self.evaluate_args(arguments, scope, piped)?;
+        self.call_with(&callee, values)
+    }
+
     fn call(&mut self, callee: &Value, values: Vec<Value>) -> Result<Value> {
+        self.call_with(callee, EvaluatedArgs::positional(values))
+    }
+
+    fn call_with(&mut self, callee: &Value, values: EvaluatedArgs) -> Result<Value> {
         let Value::Function(callable) = callee else {
             return Err(callee.expected("a function"));
         };
         match &callable.kind {
+            CallableKind::Builtin(kind) => {
+                self.builtin(*kind, values.positional_only(&callable.name)?)
+            }
+            CallableKind::Local { id, arity } => {
+                let values = values.positional_only(&callable.name)?;
+                check_arity(&callable.name, *arity, values.len())?;
+                let call = self
+                    .locals
+                    .and_then(|functions| functions.get(id))
+                    .ok_or_else(|| {
+                        Error::new(
+                            "ValueError",
+                            format!(
+                                "host function '{}' is unavailable in this execution",
+                                callable.name
+                            ),
+                        )
+                    })?;
+                call(&values)
+            }
             CallableKind::Native { arity, call } => {
+                let values = values.positional_only(&callable.name)?;
                 if let Some(arity) = arity {
                     check_arity(&callable.name, *arity, values.len())?;
                 }
                 call(&values)
             }
-            CallableKind::Script { function, scope } => {
-                check_arity(&callable.name, function.parameters.len(), values.len())?;
-                let parent = scope.upgrade().ok_or_else(|| {
-                    Error::new("ValueError", "function belongs to a finished execution")
-                })?;
-                if self.call_depth >= 64 {
-                    return Err(Error::new("RecursionError", "call depth exceeds 64 levels"));
-                }
-                let mut local_names = BTreeSet::new();
-                collect_locals(&function.body, &mut local_names);
-                let scope = Rc::new(Scope {
-                    path: parent.path.clone(),
-                    names: RefCell::new(function.parameters.iter().cloned().zip(values).collect()),
-                    exports: RefCell::default(),
-                    local_names,
-                    parent: Some(parent),
-                    captured: Cell::new(false),
-                });
-                self.call_depth += 1;
-                let result = self.block(&function.body, &scope);
-                self.call_depth -= 1;
-                match result? {
-                    Flow::Return(value) => Ok(value),
-                    _ => Ok(Value::Null),
-                }
-            }
+            CallableKind::Script {
+                function,
+                scope,
+                receiver,
+            } => self.call_script(function, scope, receiver, values),
+            CallableKind::Constructor(structure) => self.construct(structure, values),
         }
     }
 
@@ -483,6 +810,19 @@ fn collect_locals(statements: &Block, locals: &mut BTreeSet<String>) {
             StatementKind::Function(function, _) => {
                 locals.insert(function.name.clone());
             }
+            StatementKind::Struct(declaration, _) => {
+                locals.insert(declaration.name.clone());
+            }
+            StatementKind::Enum(name, _, _) => {
+                locals.insert(name.clone());
+            }
+            StatementKind::Destructure(pattern, _) => pattern.names(locals),
+            StatementKind::Match(_, cases) => {
+                for case in cases {
+                    case.pattern.names(locals);
+                    collect_locals(&case.body, locals);
+                }
+            }
             StatementKind::If(branches, otherwise) => {
                 for (_, body) in branches {
                     collect_locals(body, locals);
@@ -527,6 +867,8 @@ fn checked_int(value: Option<i64>) -> Result<Value> {
 fn binary(left: Value, op: Binary, right: Value) -> Result<Value> {
     use Binary::*;
     match op {
+        In => return right.contains(&left),
+        Contains => return left.contains(&right),
         Equal => return Ok(Value::Bool(left == right)),
         NotEqual => return Ok(Value::Bool(left != right)),
         Less | LessEqual | Greater | GreaterEqual => {
