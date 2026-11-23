@@ -1,0 +1,2 @@
+title = document_title()
+return {document: title, characters: len(title)}

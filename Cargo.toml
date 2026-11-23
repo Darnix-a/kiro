@@ -1,0 +1,15 @@
+[package]
+name = "kiro-lang"
+version = "0.1.0"
+edition = "2024"
+default-run = "kr"
+
+[lib]
+name = "kiro"
+
+[[bin]]
+name = "kr"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }

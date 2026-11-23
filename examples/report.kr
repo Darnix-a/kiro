@@ -1,0 +1,12 @@
+import fs
+import json
+import process
+import "./report_helpers.kr" as report
+
+input = args[0]
+result = process.run("cat", [input])
+checks = json.parse(result.stdout)
+failures = report.failed_checks(checks)
+
+fs.write_text("failures.json", json.stringify(failures))
+print("Wrote", len(failures), "failed check(s) to failures.json")

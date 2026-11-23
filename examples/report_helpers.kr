@@ -1,0 +1,6 @@
+export fn failed_checks(checks):
+    failures = []
+    for check in checks:
+        if check.failed:
+            failures.append(check)
+    return failures
