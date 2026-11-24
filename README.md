@@ -58,8 +58,9 @@ CoreX checkout that supports the Kiro bridge, use `cx kiro script.kr` for a
 foreground action or `cx bg run script.kr` for a background script. The
 [embedding example](examples/embed.rs) shows direct Rust integration.
 
-[Editor setup](editors/README.md) covers syntax highlighting in VS Code,
-Kate, and Vim or Neovim.
+Run `./editors/install.sh vscode` from the checkout to install VS Code
+highlighting. [Editor setup](editors/README.md) also covers VSIX installation,
+Kate, Vim, and Neovim.
 
 ## Development
 

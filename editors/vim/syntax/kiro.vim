@@ -11,7 +11,7 @@ syntax match kiroComment /#.*$/
 syntax match kiroEscape /\\./ contained
 
 syntax cluster kiroExpression contains=kiroKeyword,kiroConstant,kiroBuiltin,kiroNumber,kiroOperator,kiroSingle,kiroDouble,kiroCommand,kiroInterpolation
-syntax region kiroInterpolation matchgroup=kiroInterpolationDelimiter start=+{+ end=+}+ contained oneline contains=`kiroExpression
+syntax region kiroInterpolation matchgroup=kiroInterpolationDelimiter start=+{+ end=+}+ contained oneline contains=@kiroExpression
 syntax region kiroSingle start=+'+ skip=+\\.+ end=+'+ oneline contains=kiroEscape
 syntax region kiroDouble start=+"+ skip=+\\.+ end=+"+ oneline contains=kiroEscape,kiroInterpolation
 syntax region kiroCommand start=+\$\s*"+ skip=+\\.+ end=+"+ oneline contains=kiroEscape,kiroInterpolation
